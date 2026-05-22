@@ -1,30 +1,22 @@
 use std::{cell::RefCell, hash::Hasher, mem, ptr};
 
 pub struct SipHash {
-    init: Init,
-    state: RefCell<State>,
+    inner: RefCell<Inner>,
 }
 
-struct State {
+struct Inner {
     c: usize,
     d: usize,
+    v0: u64,
+    v1: u64,
+    v2: u64,
+    v3: u64,
     len: usize,
     buf: [u8; 8],
     cursor: usize,
-    v0: u64,
-    v1: u64,
-    v2: u64,
-    v3: u64,
 }
 
-struct Init {
-    v0: u64,
-    v1: u64,
-    v2: u64,
-    v3: u64,
-}
-
-impl State {
+impl Inner {
     fn round(&mut self, n: usize) {
         for _ in 0..n {
             self.v0 = self.v0.wrapping_add(self.v1);
@@ -87,58 +79,39 @@ impl State {
         self.round(self.d);
         self.v0 ^ self.v1 ^ self.v2 ^ self.v3
     }
-
-    fn reset(&mut self, init: &Init) {
-        self.len = 0;
-        self.cursor = 0;
-        self.buf.fill(0);
-        self.v0 = init.v0;
-        self.v1 = init.v1;
-        self.v2 = init.v2;
-        self.v3 = init.v3;
-    }
 }
 
 impl SipHash {
     pub fn new(c: usize, d: usize, key: &[u8; 16]) -> Self {
         let mut k0: u64 = u64::from_le_bytes(key[..8].try_into().unwrap());
         let mut k1: u64 = u64::from_le_bytes(key[8..].try_into().unwrap());
-        let init = Init {
-            v0: k0 ^ 0x736f6d6570736575,
-            v1: k1 ^ 0x646f72616e646f6d,
-            v2: k0 ^ 0x6c7967656e657261,
-            v3: k1 ^ 0x7465646279746573,
-        };
-        unsafe {
-            ptr::write_volatile(&mut k0, mem::zeroed());
-            ptr::write_volatile(&mut k1, mem::zeroed());
-        }
-        let state = RefCell::new(State {
+        let inner = RefCell::new(Inner {
             c,
             d,
             len: 0,
             buf: [0; 8],
             cursor: 0,
-            v0: init.v0,
-            v1: init.v1,
-            v2: init.v2,
-            v3: init.v3,
+            v0: k0 ^ 0x736f6d6570736575,
+            v1: k1 ^ 0x646f72616e646f6d,
+            v2: k0 ^ 0x6c7967656e657261,
+            v3: k1 ^ 0x7465646279746573,
         });
+        unsafe {
+            ptr::write_volatile(&mut k0, mem::zeroed());
+            ptr::write_volatile(&mut k1, mem::zeroed());
+        }
         // explicit zero k0 & k1 on stack
-        SipHash { init, state }
+        SipHash { inner }
     }
 }
 
 impl Hasher for SipHash {
     fn write(&mut self, bytes: &[u8]) {
-        self.state.borrow_mut().feed(bytes);
+        self.inner.borrow_mut().feed(bytes);
     }
 
     fn finish(&self) -> u64 {
-        let mut state = self.state.borrow_mut();
-        let hash = state.finalize();
-        state.reset(&self.init);
-        hash
+        self.inner.borrow_mut().finalize()
     }
 }
 
