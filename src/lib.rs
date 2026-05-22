@@ -1,4 +1,148 @@
-pub fn sip_hash(c: usize, d: usize, key: &[u8; 16], message: &[u8]) -> u64 {
+use std::{cell::RefCell, hash::Hasher, mem, ptr};
+
+pub struct SipHash {
+    init: Init,
+    state: RefCell<State>,
+}
+
+struct State {
+    c: usize,
+    d: usize,
+    len: usize,
+    buf: [u8; 8],
+    cursor: usize,
+    v0: u64,
+    v1: u64,
+    v2: u64,
+    v3: u64,
+}
+
+struct Init {
+    v0: u64,
+    v1: u64,
+    v2: u64,
+    v3: u64,
+}
+
+impl State {
+    fn round(&mut self, n: usize) {
+        for _ in 0..n {
+            self.v0 = self.v0.wrapping_add(self.v1);
+            self.v2 = self.v2.wrapping_add(self.v3);
+            self.v1 = self.v1.rotate_left(13);
+            self.v3 = self.v3.rotate_left(16);
+            self.v1 ^= self.v0;
+            self.v3 ^= self.v2;
+            self.v0 = self.v0.rotate_left(32);
+            self.v2 = self.v2.wrapping_add(self.v1);
+            self.v0 = self.v0.wrapping_add(self.v3);
+            self.v1 = self.v1.rotate_left(17);
+            self.v3 = self.v3.rotate_left(21);
+            self.v1 ^= self.v2;
+            self.v3 ^= self.v0;
+            self.v2 = self.v2.rotate_left(32);
+        }
+    }
+
+    fn cap(&self) -> usize {
+        8 - self.cursor
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        let cap = self.cap();
+        if cap > bytes.len() {
+            let cursor = self.cursor;
+            let cursor_n = cursor + bytes.len();
+            self.buf[cursor..cursor_n].copy_from_slice(bytes);
+            self.cursor = cursor_n;
+        } else {
+            let cursor = self.cursor;
+            self.buf[cursor..].copy_from_slice(&bytes[..cap]);
+            let m = u64::from_le_bytes(self.buf);
+            self.v3 ^= m;
+            self.round(self.c);
+            self.v0 ^= m;
+            let mut chunks = bytes[cap..].chunks_exact(8);
+            for chunk in chunks.by_ref() {
+                let m = u64::from_le_bytes(chunk.try_into().unwrap());
+                self.v3 ^= m;
+                self.round(self.c);
+                self.v0 ^= m;
+            }
+            let remainder = chunks.remainder();
+            self.buf[..remainder.len()].copy_from_slice(remainder);
+            self.cursor = remainder.len();
+        }
+        self.len += bytes.len();
+    }
+
+    fn finalize(&mut self) -> u64 {
+        self.buf[self.cursor..7].fill(0);
+        self.buf[7] = self.len as u8;
+        let m = u64::from_le_bytes(self.buf);
+        self.v3 ^= m;
+        self.round(self.c);
+        self.v0 ^= m;
+        self.v2 ^= 0xff;
+        self.round(self.d);
+        self.v0 ^ self.v1 ^ self.v2 ^ self.v3
+    }
+
+    fn reset(&mut self, init: &Init) {
+        self.len = 0;
+        self.cursor = 0;
+        self.buf.fill(0);
+        self.v0 = init.v0;
+        self.v1 = init.v1;
+        self.v2 = init.v2;
+        self.v3 = init.v3;
+    }
+}
+
+impl SipHash {
+    pub fn new(c: usize, d: usize, key: &[u8; 16]) -> Self {
+        let mut k0: u64 = u64::from_le_bytes(key[..8].try_into().unwrap());
+        let mut k1: u64 = u64::from_le_bytes(key[8..].try_into().unwrap());
+        let init = Init {
+            v0: k0 ^ 0x736f6d6570736575,
+            v1: k1 ^ 0x646f72616e646f6d,
+            v2: k0 ^ 0x6c7967656e657261,
+            v3: k1 ^ 0x7465646279746573,
+        };
+        unsafe {
+            ptr::write_volatile(&mut k0, mem::zeroed());
+            ptr::write_volatile(&mut k1, mem::zeroed());
+        }
+        let state = RefCell::new(State {
+            c,
+            d,
+            len: 0,
+            buf: [0; 8],
+            cursor: 0,
+            v0: init.v0,
+            v1: init.v1,
+            v2: init.v2,
+            v3: init.v3,
+        });
+        // explicit zero k0 & k1 on stack
+        SipHash { init, state }
+    }
+}
+
+impl Hasher for SipHash {
+    fn write(&mut self, bytes: &[u8]) {
+        self.state.borrow_mut().feed(bytes);
+    }
+
+    fn finish(&self) -> u64 {
+        let mut state = self.state.borrow_mut();
+        let hash = state.finalize();
+        state.reset(&self.init);
+        hash
+    }
+}
+
+pub fn sip_hash_oneoff(c: usize, d: usize, key: &[u8; 16], message: &[u8]) -> u64 {
     let k0: u64 = u64::from_le_bytes(key[..8].try_into().unwrap());
     let k1: u64 = u64::from_le_bytes(key[8..].try_into().unwrap());
     let mut v0 = k0 ^ 0x736f6d6570736575;
@@ -56,7 +200,20 @@ mod official_tests {
 
     #[test]
     fn test_empty() {
-        let actual = sip_hash(2, 4, &KEY, &[]);
+        let actual = sip_hash_oneoff(2, 4, &KEY, &[]);
+        let expected = u64::from_le_bytes([0x31_u8, 0x0e, 0x0e, 0xdd, 0x47, 0xdb, 0x6f, 0x72]);
+        assert_eq!(
+            expected, actual,
+            "expected: {:x}, actual {:x}",
+            expected, actual
+        );
+    }
+
+    #[test]
+    fn test_empty_hasher() {
+        let mut hasher = SipHash::new(2, 4, &KEY);
+        hasher.write(&[]);
+        let actual = hasher.finish();
         let expected = u64::from_le_bytes([0x31_u8, 0x0e, 0x0e, 0xdd, 0x47, 0xdb, 0x6f, 0x72]);
         assert_eq!(
             expected, actual,
@@ -67,7 +224,20 @@ mod official_tests {
 
     #[test]
     fn test_1() {
-        let actual = sip_hash(2, 4, &KEY, &[0x0]);
+        let actual = sip_hash_oneoff(2, 4, &KEY, &[0x00]);
+        let expected = u64::from_le_bytes([0xfd_u8, 0x67, 0xdc, 0x93, 0xc5, 0x39, 0xf8, 0x74]);
+        assert_eq!(
+            expected, actual,
+            "expected: {:x}, actual {:x}",
+            expected, actual
+        );
+    }
+
+    #[test]
+    fn test_1_hasher() {
+        let mut hasher = SipHash::new(2, 4, &KEY);
+        hasher.write(&[0x00]);
+        let actual = hasher.finish();
         let expected = u64::from_le_bytes([0xfd_u8, 0x67, 0xdc, 0x93, 0xc5, 0x39, 0xf8, 0x74]);
         assert_eq!(
             expected, actual,
@@ -78,12 +248,22 @@ mod official_tests {
 
     #[test]
     fn test_10() {
-        let actual = sip_hash(
-            2,
-            4,
-            &KEY,
-            &[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09],
+        let mut hasher = SipHash::new(2, 4, &KEY);
+        hasher.write(&[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]);
+        let actual = hasher.finish();
+        let expected = u64::from_le_bytes([0xf3, 0xb9, 0xdd, 0x94, 0xc5, 0xbb, 0x5d, 0x7a]);
+        assert_eq!(
+            expected, actual,
+            "expected: {:x}, actual {:x}",
+            expected, actual
         );
+    }
+
+    #[test]
+    fn test_10_hasher() {
+        let mut hasher = SipHash::new(2, 4, &KEY);
+        hasher.write(&[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09]);
+        let actual = hasher.finish();
         let expected = u64::from_le_bytes([0xf3, 0xb9, 0xdd, 0x94, 0xc5, 0xbb, 0x5d, 0x7a]);
         assert_eq!(
             expected, actual,
