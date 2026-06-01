@@ -1,4 +1,5 @@
 use std::hash::Hasher;
+use chunk_buf::{Chunk, ChunkBuf};
 use zeroize::Zeroize;
 
 #[derive(Clone)]
@@ -55,55 +56,11 @@ impl Drop for State {
     }
 }
 
-#[derive(Default, Clone)]
-struct Buf {
-    buf: [u8; 8],
-    cursor: usize,
-    len: usize,
-}
-
-impl Buf {
-    fn write(&mut self, bytes: &[u8]) -> Option<(u64, usize)> {
-        let cap = 8 - self.cursor;
-        if cap > bytes.len() {
-            let cursor_n = self.cursor + bytes.len();
-            self.buf[self.cursor..cursor_n].copy_from_slice(bytes);
-            self.cursor = cursor_n;
-            self.len += bytes.len();
-            None
-        } else {
-            self.buf[self.cursor..].copy_from_slice(&bytes[..cap]);
-            self.cursor = 0;
-            self.len += cap;
-            Some((self.as_u64_le(), cap))
-        }
-    }
-
-    fn finish(&mut self) -> u64 {
-        self.buf[self.cursor..7].fill(0);
-        self.buf[7] = self.len as u8;
-        self.cursor = 0;
-        self.as_u64_le()
-    }
-
-    fn as_u64_le(&self) -> u64 {
-        u64::from_le_bytes(self.buf)
-    }
-}
-
-impl Drop for Buf {
-    fn drop(&mut self) {
-        self.len = 0;
-        self.cursor = 0;
-        self.buf.fill(0);
-    }
-}
-
 pub struct SipHash {
     c: usize,
     d: usize,
     state: State,
-    buf: Buf,
+    buf: ChunkBuf,
 }
 
 impl SipHash {
@@ -119,7 +76,7 @@ impl SipHash {
                 k0 ^ 0x6c7967656e657261,
                 k1 ^ 0x7465646279746573,
             ),
-            buf: Buf::default(),
+            buf: ChunkBuf::new(8),
         };
         k0.zeroize();
         k1.zeroize();
@@ -132,11 +89,12 @@ impl SipHash {
 }
 
 impl Hasher for SipHash {
-    fn write(&mut self, mut bytes: &[u8]) {
-        while let Some((n, offset)) = self.buf.write(bytes) {
+    fn write(&mut self, mut buf: &[u8]) {
+        while let Some(Chunk {bytes, consumed}) = self.buf.update(buf) {
+            let n = u64::from_le_bytes(bytes.try_into().unwrap());
             self.update(n);
-            if offset < bytes.len() {
-                bytes = &bytes[offset..];
+            if consumed < buf.len() {
+                buf = &buf[consumed..];
             } else {
                 return;
             }
@@ -144,9 +102,13 @@ impl Hasher for SipHash {
     }
 
     fn finish(&self) -> u64 {
-        let mut buf_cloned = self.buf.clone();
         let mut state_cloned = self.state.clone();
-        state_cloned.update(self.c, buf_cloned.finish());
+        let mut last_buf = [0_u8; 8];
+        let remainder = self.buf.remainder();
+        last_buf[..remainder.len()].copy_from_slice(remainder);
+        last_buf[7] = self.buf.acc_consumed() as u8;
+        let last_n = u64::from_le_bytes(last_buf);
+        state_cloned.update(self.c, last_n);
         state_cloned.finish(self.d)
     }
 }

@@ -5,3 +5,4 @@ edition = "2024"
 
 [dependencies]
 zeroize = "1.8.2"
+chunk-buf = { git = "https://github.com/schemehcs/chunk-buf.git" }
