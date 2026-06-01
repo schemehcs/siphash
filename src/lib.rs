@@ -1,5 +1,5 @@
-use std::hash::Hasher;
 use chunk_buf::{Chunk, ChunkBuf};
+use std::hash::Hasher;
 use zeroize::Zeroize;
 
 #[derive(Clone)]
@@ -60,7 +60,7 @@ pub struct SipHash {
     c: usize,
     d: usize,
     state: State,
-    buf: ChunkBuf,
+    buf: ChunkBuf<u8>,
 }
 
 impl SipHash {
@@ -90,7 +90,7 @@ impl SipHash {
 
 impl Hasher for SipHash {
     fn write(&mut self, mut buf: &[u8]) {
-        while let Some(Chunk {bytes, consumed}) = self.buf.update(buf) {
+        while let Some(Chunk { bytes, consumed }) = self.buf.update(buf) {
             let n = u64::from_le_bytes(bytes.try_into().unwrap());
             self.update(n);
             if consumed < buf.len() {
